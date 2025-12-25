@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="endpoint_endpoint_form_view_customer_pricelist_export" model="ir.ui.view">
+        <field name="name">endpoint.endpoint.form.customer_pricelist_export</field>
+        <field name="model">endpoint.endpoint</field>
+        <field name="inherit_id" ref="endpoint_product_catalog.endpoint_endpoint_form_view"/>
+        <field name="arch" type="xml">
+
+            <!-- Odoo 17+: no attrs/states. Hide assortment field for this exec_mode to avoid setup friction. -->
+            <xpath expr="//field[@name='product_assortment_id']" position="attributes">
+                <attribute name="invisible">exec_mode == 'customer_pricelist_export'</attribute>
+            </xpath>
+
+            <!-- Show route_type so you can set it to JSON (some endpoint stacks hide it) -->
+            <xpath expr="//field[@name='route']" position="after">
+                <field name="route_type"
+                       invisible="exec_mode != 'customer_pricelist_export'"/>
+            </xpath>
+
+
+            <xpath expr="//group[field[@name='product_assortment_id']]" position="after">
+                <group string="Customer Pricelist Export"
+                       invisible="exec_mode != 'customer_pricelist_export'">
+                    <field name="catalog_partner_id" required="1"/>
+                    <field name="catalog_pricelist_id"/>
+                    <div class="o_form_label">
+                        Use API Key auth (endpoint_auth_api_key) for a semi-private endpoint.
+                    </div>
+                </group>
+            </xpath>
+        </field>
+    </record>
+</odoo>
