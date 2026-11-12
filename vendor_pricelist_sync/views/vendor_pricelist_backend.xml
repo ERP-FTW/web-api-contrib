@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_vendor_pricelist_backend_list" model="ir.ui.view">
+        <field name="name">vendor.pricelist.backend.list</field>
+        <field name="model">vendor.pricelist.backend</field>
+        <field name="arch" type="xml">
+            <list>
+                <field name="name"/>
+                <field name="vendor_partner_id"/>
+                <field name="base_url"/>
+                <field name="endpoint_path"/>
+                <field name="last_sync_at"/>
+                <field name="last_http_status"/>
+                <field name="active"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_vendor_pricelist_backend_form" model="ir.ui.view">
+        <field name="name">vendor.pricelist.backend.form</field>
+        <field name="model">vendor.pricelist.backend</field>
+        <field name="arch" type="xml">
+            <form>
+                <header>
+                    <button name="action_test_connection" type="object" string="Test Connection" class="btn-secondary"/>
+                    <button name="action_sync_now" type="object" string="Sync Now" class="btn-primary"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group>
+                            <field name="name"/>
+                            <field name="active"/>
+                            <field name="company_id"/>
+                            <field name="vendor_partner_id"/>
+                        </group>
+                        <group string="Endpoint">
+                            <field name="base_url"/>
+                            <field name="endpoint_path"/>
+                            <field name="api_header_name"/>
+                            <field name="api_key" password="True"/>
+                        </group>
+                    </group>
+
+                    <group string="Sync Options">
+                        <field name="include_inactive"/>
+                        <field name="only_purchasable"/>
+                        <field name="create_missing_products"/>
+                        <field name="local_pricelist_id"/>
+                    </group>
+
+                    <group string="Status">
+                        <field name="last_sync_at" readonly="1"/>
+                        <field name="last_http_status" readonly="1"/>
+                    </group>
+
+                    <group string="Last Error" invisible="not last_error">
+                        <field name="last_error" readonly="1"/>
+                    </group>
+
+                    <group string="Last Response Snippet" invisible="not last_response_snippet">
+                        <field name="last_response_snippet" readonly="1"/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_vendor_pricelist_backend" model="ir.actions.act_window">
+        <field name="name">Vendor Pricelist Backends</field>
+        <field name="res_model">vendor.pricelist.backend</field>
+        <field name="view_mode">list,form</field>
+    </record>
+
+    <menuitem id="menu_vendor_pricelist_root" name="Vendor Sync" parent="purchase.menu_purchase_root" sequence="80"/>
+    <menuitem id="menu_vendor_pricelist_backend" name="Vendor Pricelist Backends"
+              parent="menu_vendor_pricelist_root" action="action_vendor_pricelist_backend" sequence="10"/>
+</odoo>
