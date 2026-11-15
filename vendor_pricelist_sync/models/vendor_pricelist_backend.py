@@ -58,6 +58,7 @@ class VendorPricelistBackend(models.Model):
     include_inactive = fields.Boolean(default=False)
     only_purchasable = fields.Boolean(default=True)
     create_missing_products = fields.Boolean(default=False)
+    page_size = fields.Integer(default=2000, required=True)
 
     local_pricelist_id = fields.Many2one(
         "product.pricelist",
@@ -72,6 +73,10 @@ class VendorPricelistBackend(models.Model):
     last_error = fields.Text(string="Last Error")
     last_http_status = fields.Integer(string="Last HTTP Status")
     last_response_snippet = fields.Text(string="Last Response Snippet")
+    last_exported_count = fields.Integer(readonly=True)
+    last_created_count = fields.Integer(readonly=True)
+    last_updated_count = fields.Integer(readonly=True)
+    last_skipped_count = fields.Integer(readonly=True)
 
     def action_test_connection(self):
         self.ensure_one()
@@ -96,37 +101,112 @@ class VendorPricelistBackend(models.Model):
     def _sync(self):
         self.ensure_one()
         try:
-            payload = self._fetch_payload()
-            items = payload.get("items") or []
-            if not isinstance(items, list):
-                raise UserError(_("Vendor response missing 'items' list."))
+            with self.env.cr.savepoint():
+                summary = self._sync_all_pages()
+                self.write(
+                    {
+                        "last_sync_at": fields.Datetime.now(),
+                        "last_error": False,
+                        "last_exported_count": summary["exported_count"],
+                        "last_created_count": summary["created"],
+                        "last_updated_count": summary["updated"],
+                        "last_skipped_count": summary["skipped_or_rejected"],
+                    }
+                )
 
-            updated = created = skipped = 0
-            for item in items:
-                res = self._apply_item(item)
-                if res == "updated":
-                    updated += 1
-                elif res == "created":
-                    created += 1
-                else:
-                    skipped += 1
-
-            self.last_sync_at = fields.Datetime.now()
-            self.last_error = False
-
-            # Optional convenience: stamp a local pricelist with the sync time.
-            if self.local_pricelist_id:
-                self.local_pricelist_id.sudo().write({
-                    "api_last_sync_at": self.last_sync_at,
-                })
-            _logger.info(
-                "Vendor pricelist sync done backend_id=%s updated=%s created=%s skipped=%s",
-                self.id, updated, created, skipped
-            )
+                if self.local_pricelist_id:
+                    self.local_pricelist_id.sudo().write(
+                        {"api_last_sync_at": self.last_sync_at}
+                    )
+                _logger.info(
+                    "Vendor pricelist sync done backend_id=%s exported=%s updated=%s created=%s skipped=%s",
+                    self.id,
+                    summary["exported_count"],
+                    summary["updated"],
+                    summary["created"],
+                    summary["skipped_or_rejected"],
+                )
+                return summary
         except Exception as exc:
             self.last_error = str(exc)
             _logger.exception("Vendor pricelist sync failed backend_id=%s: %s", self.id, exc)
             raise
+
+    def _sync_all_pages(self):
+        page_size = int(self.page_size or 0)
+        if page_size <= 0 or page_size > 2000:
+            raise UserError(_("Page Size must be between 1 and 2000."))
+
+        offset = 0
+        expected_total = None
+        seen_page_keys = set()
+        counts = {"created": 0, "updated": 0, "skipped_or_rejected": 0}
+
+        while True:
+            payload = self._fetch_payload(limit=page_size, offset=offset)
+            items = payload.get("items")
+            meta = payload.get("meta")
+            if not isinstance(items, list) or not isinstance(meta, dict):
+                raise UserError(_("Vendor response must contain 'items' list and 'meta' object."))
+
+            try:
+                response_offset = int(meta["offset"])
+                response_limit = int(meta["limit"])
+                response_count = int(meta["count"])
+                total_count = int(meta["total_count"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UserError(_("Vendor response contains invalid pagination metadata.")) from exc
+
+            if response_offset != offset or response_limit != page_size:
+                raise UserError(_("Vendor response pagination does not match the requested page."))
+            if response_count != len(items) or response_count > response_limit:
+                raise UserError(_("Vendor response pagination count is inconsistent."))
+            if total_count < response_offset + response_count:
+                raise UserError(_("Vendor response total_count is inconsistent."))
+            if expected_total is None:
+                expected_total = total_count
+            elif expected_total != total_count:
+                raise UserError(_("Vendor response total_count changed during pagination."))
+
+            page_key = tuple(
+                (item.get("barcode"), item.get("default_code"), item.get("vendor_product_id"))
+                if isinstance(item, dict)
+                else (repr(item),)
+                for item in items
+            )
+            if items and page_key in seen_page_keys:
+                raise UserError(_("Vendor response repeated a previously consumed page."))
+            seen_page_keys.add(page_key)
+
+            for item in items:
+                result = self._apply_item(item)
+                action = result.get("action") if isinstance(result, dict) else False
+                if action not in counts:
+                    raise UserError(_("Vendor item returned an unknown reconciliation action."))
+                counts[action] += 1
+
+            has_more = bool(meta.get("has_more"))
+            next_offset = meta.get("next_offset")
+            if has_more:
+                try:
+                    next_offset = int(next_offset)
+                except (TypeError, ValueError) as exc:
+                    raise UserError(_("Vendor response next_offset is invalid.")) from exc
+                if not items or next_offset != offset + len(items) or next_offset <= offset:
+                    raise UserError(_("Vendor response pagination did not advance deterministically."))
+                offset = next_offset
+                continue
+            if next_offset not in (False, None):
+                raise UserError(_("Vendor response has next_offset while has_more is false."))
+            break
+
+        exported_count = sum(counts.values())
+        if exported_count != expected_total:
+            raise UserError(
+                _("Vendor response reconciliation failed: exported %s of %s items.")
+                % (exported_count, expected_total)
+            )
+        return {"exported_count": exported_count, **counts}
 
     def _fetch_payload(self, limit=2000, offset=0):
         self.ensure_one()
@@ -147,7 +227,8 @@ class VendorPricelistBackend(models.Model):
             self.last_response_snippet = (resp.text or "")[:2000]
             if resp.status_code >= 400:
                 raise UserError(_("Vendor endpoint HTTP %s: %s") % (resp.status_code, resp.text[:200]))
-            return resp.json()
+            data = resp.json()
+            return self._normalize_payload(data)
 
         import urllib.request
         req = urllib.request.Request(url, headers=headers, method="GET")
@@ -155,7 +236,15 @@ class VendorPricelistBackend(models.Model):
             body = f.read().decode("utf-8", errors="replace")
             self.last_http_status = getattr(f, "status", 200)
             self.last_response_snippet = body[:2000]
-            return json.loads(body)
+            return self._normalize_payload(json.loads(body))
+
+    def _normalize_payload(self, data):
+        if not isinstance(data, dict):
+            raise UserError(_("Vendor response must be a JSON object."))
+        payload = data.get("payload", data)
+        if not isinstance(payload, dict):
+            raise UserError(_("Vendor response 'payload' must be an object."))
+        return payload
 
     def _supplier_partner_field(self):
         """Odoo 18 uses partner_id; older versions used name."""
@@ -185,142 +274,148 @@ class VendorPricelistBackend(models.Model):
             _logger.debug("Could not parse %s=%r for %s", field_name, value, model._name)
         return False
 
-    # -------------------------
-    # Patch this method
-    # -------------------------
+    def _find_product(self, item):
+        Product = self.env["product.product"].sudo().with_context(active_test=False)
+        barcode = item.get("barcode") or False
+        default_code = item.get("default_code") or False
+
+        for field_name, value in (("barcode", barcode), ("default_code", default_code)):
+            if not value:
+                continue
+            matches = Product.search([(field_name, "=", value)], limit=2)
+            if len(matches) > 1:
+                raise UserError(
+                    _("Ambiguous product %s %r; refusing to select an arbitrary record.")
+                    % (field_name, value)
+                )
+            if matches:
+                return matches
+
+        if not self.create_missing_products:
+            raise UserError(
+                _("Could not match product by barcode or SKU and product creation is disabled.")
+            )
+
+        template = self.env["product.template"].sudo().create(
+            {
+                "name": item.get("name") or default_code or barcode or _("Vendor Product"),
+                "purchase_ok": True,
+                "sale_ok": False,
+                "company_id": self.company_id.id,
+            }
+        )
+        product = template.product_variant_id
+        product.write({"default_code": default_code, "barcode": barcode})
+        return product
+
+    def _resolve_uom(self, item, product):
+        uom_data = item.get("purchase_uom")
+        if not isinstance(uom_data, dict):
+            raise UserError(_("Vendor item is missing purchase_uom mapping data."))
+
+        uom = self.env["uom.uom"]
+        external_id = uom_data.get("external_id")
+        if external_id:
+            uom = self.env.ref(external_id, raise_if_not_found=False)
+            if not uom or uom._name != "uom.uom":
+                raise UserError(_("Unknown purchase UoM external ID %s.") % external_id)
+        else:
+            name = uom_data.get("name")
+            reference_external_id = uom_data.get("reference_external_id")
+            reference_uom = self.env.ref(
+                reference_external_id, raise_if_not_found=False
+            ) if reference_external_id else False
+            if not name or not reference_uom or reference_uom._name != "uom.uom":
+                raise UserError(
+                    _("Purchase UoM requires an external ID or name/reference fallback.")
+                )
+            matches = self.env["uom.uom"].search([("name", "=", name)]).filtered(
+                lambda candidate: candidate._has_common_reference(reference_uom)
+            )
+            if len(matches) != 1:
+                raise UserError(_("Purchase UoM fallback is missing or ambiguous."))
+            uom = matches
+
+        if not uom._has_common_reference(product.uom_id):
+            raise UserError(_("Purchase UoM is incompatible with the matched product."))
+        return uom
+
+    def _resolve_currency(self, item):
+        price_data = item.get("price")
+        currency_data = price_data.get("currency") if isinstance(price_data, dict) else None
+        code = currency_data.get("code") if isinstance(currency_data, dict) else None
+        if not code:
+            raise UserError(_("Vendor item is missing an ISO currency code."))
+        currencies = self.env["res.currency"].with_context(active_test=False).search(
+            [("name", "=", code)], limit=2
+        )
+        if len(currencies) != 1:
+            raise UserError(_("Currency code %s is missing or ambiguous.") % code)
+        return currencies
 
     def _apply_item(self, item):
-        """Apply one vendor item to local product + supplierinfo."""
+        """Apply one classified item without using any remote database ID."""
         self.ensure_one()
-
-        SupplierInfo = self.env["product.supplierinfo"].sudo()
-        Product = self.env["product.product"].sudo()
-        ProductTmpl = self.env["product.template"].sudo()
-
-        vendor_partner_field = self._supplier_partner_field()
-
-        vendor_partner = self.vendor_partner_id
-        if not vendor_partner:
+        if not isinstance(item, dict):
+            raise UserError(_("Vendor item must be a JSON object."))
+        if not self.vendor_partner_id:
             raise UserError(_("Vendor Partner is missing on the backend configuration."))
 
-        # --- locate or create product ---
-        default_code = item.get("default_code") or False
-        barcode = item.get("barcode") or False
-        vendor_product_id = item.get("vendor_product_id") or False
-        name = item.get("name") or _("Vendor Product")
+        SupplierInfo = self.env["product.supplierinfo"].sudo()
+        vendor_partner_field = self._supplier_partner_field()
+        product = self._find_product(item)
+        uom = self._resolve_uom(item, product)
+        currency = self._resolve_currency(item)
 
-        product = False
-        if barcode:
-            product = Product.search([("barcode", "=", barcode)], limit=1)
-        if not product and default_code:
-            product = Product.search([("default_code", "=", default_code)], limit=1)
+        price_data = item.get("price")
+        if not isinstance(price_data, dict) or price_data.get("value") is None:
+            raise UserError(_("Vendor item is missing a price value."))
+        try:
+            price = float(price_data["value"])
+            min_qty = float(item.get("min_qty") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise UserError(_("Vendor item price or minimum quantity is invalid.")) from exc
 
-        if not product and self.create_missing_products:
-            tmpl_vals = {"name": name, "purchase_ok": True, "sale_ok": False}
-            if default_code:
-                # default_code is on product.product; we set it after variant exists
-                pass
-            tmpl = ProductTmpl.create(tmpl_vals)
-            product = tmpl.product_variant_id
-            if default_code:
-                product.default_code = default_code
-            if barcode:
-                product.barcode = barcode
+        start_date = self._parse_for_field(SupplierInfo, "date_start", price_data.get("start_date"))
+        end_date = self._parse_for_field(SupplierInfo, "date_end", price_data.get("end_date"))
+        vals = {
+            vendor_partner_field: self.vendor_partner_id.id,
+            "product_id": product.id,
+            "product_tmpl_id": product.product_tmpl_id.id,
+            "company_id": self.company_id.id,
+            "product_uom_id": uom.id,
+            "currency_id": currency.id,
+            "price": price,
+            "min_qty": min_qty,
+            "date_start": start_date,
+            "date_end": end_date,
+        }
 
-        if not product:
-            raise UserError(_("Could not match product and 'Create Missing Products' is disabled. Item=%s") % item)
+        identity_fields = (
+            vendor_partner_field,
+            "product_id",
+            "company_id",
+            "product_uom_id",
+            "currency_id",
+            "min_qty",
+            "date_start",
+            "date_end",
+        )
+        domain = [(field_name, "=", vals[field_name]) for field_name in identity_fields]
+        matches = SupplierInfo.search(domain, limit=2)
+        if len(matches) > 1:
+            raise UserError(_("Supplier price identity is ambiguous; refusing an arbitrary update."))
 
-        # --- find existing supplierinfo line for this vendor + product/template ---
-        # Prefer product-specific line; fallback to template line
-        domain = [(vendor_partner_field, "=", vendor_partner.id)]
-        if "product_id" in SupplierInfo._fields:
-            domain_product = domain + [("product_id", "=", product.id)]
-            supplierinfo = SupplierInfo.search(domain_product, limit=1)
-        else:
-            supplierinfo = False
-
-        if not supplierinfo and "product_tmpl_id" in SupplierInfo._fields:
-            domain_tmpl = domain + [("product_tmpl_id", "=", product.product_tmpl_id.id)]
-            supplierinfo = SupplierInfo.search(domain_tmpl, limit=1)
-
-        # --- build vals from payload ---
-        price = (item.get("price") or {}).get("value")
-        start_date = (item.get("price") or {}).get("start_date")
-        end_date = (item.get("price") or {}).get("end_date")
-
-        vals = {}
-
-        # vendor
-        vals[vendor_partner_field] = vendor_partner.id
-
-        # link to product/template
-        if "product_id" in SupplierInfo._fields:
-            vals["product_id"] = product.id
-        if "product_tmpl_id" in SupplierInfo._fields:
-            vals["product_tmpl_id"] = product.product_tmpl_id.id
-
-        # price field name differs by version/customization; handle common ones
-        if "price" in SupplierInfo._fields:
-            vals["price"] = float(price or 0.0)
-        elif "price_unit" in SupplierInfo._fields:
-            vals["price_unit"] = float(price or 0.0)
-
-        # min qty (your payload might add this later)
-        if "min_qty" in SupplierInfo._fields and item.get("min_qty"):
-            vals["min_qty"] = float(item["min_qty"])
-
-        # date range from vendor pricelist rule
-        if "date_start" in SupplierInfo._fields:
-            parsed = self._parse_for_field(SupplierInfo, "date_start", start_date)
-            if parsed:
-                vals["date_start"] = parsed
-        if "date_end" in SupplierInfo._fields:
-            parsed = self._parse_for_field(SupplierInfo, "date_end", end_date)
-            if parsed:
-                vals["date_end"] = parsed
-
-        # purchase uom (optional)
-        purchase_uom = (item.get("purchase_uom") or {}).get("id")
-        if purchase_uom:
-            if "product_uom" in SupplierInfo._fields:
-                vals["product_uom"] = purchase_uom
-            elif "product_uom_id" in SupplierInfo._fields:
-                vals["product_uom_id"] = purchase_uom
-
-        # --- upsert supplierinfo ---
-        if supplierinfo:
-            supplierinfo.write(vals)
+        if matches:
+            matches.write(vals)
+            supplierinfo = matches
             action = "updated"
         else:
             supplierinfo = SupplierInfo.create(vals)
             action = "created"
 
-        return {"product_id": product.id, "supplierinfo_id": supplierinfo.id, "action": action}
-    def _find_or_create_product(self, barcode=False, default_code=False, name=False):
-        Product = self.env["product.product"].with_context(active_test=False)
-        product = False
-
-        if barcode:
-            product = Product.search([("barcode", "=", barcode)], limit=1)
-        if not product and default_code:
-            product = Product.search([("default_code", "=", default_code)], limit=1)
-        if not product and name:
-            product = Product.search([("name", "=", name)], limit=1)
-
-        if product:
-            return product
-
-        if not self.create_missing_products:
-            return False
-
-        tmpl_vals = {
-            "name": name or default_code or barcode or _("New Product"),
-            "default_code": default_code,
-            "barcode": barcode,
-            "purchase_ok": True,
-            "sale_ok": False,
-            "company_id": self.company_id.id,
+        return {
+            "product_id": product.id,
+            "supplierinfo_id": supplierinfo.id,
+            "action": action,
         }
-        tmpl = self.env["product.template"].create(tmpl_vals)
-        _logger.info("Created product template id=%s name=%s", tmpl.id, tmpl.display_name)
-        return tmpl.product_variant_id

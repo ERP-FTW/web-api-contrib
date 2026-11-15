@@ -3,7 +3,7 @@
 {
     "name": "Vendor Pricelist Sync (Simple)",
     "summary": "Sync a vendor's customer-specific pricelist snapshot into product.supplierinfo",
-    "version": "18.0.1.0.5",
+    "version": "19.0.1.0.5",
     "category": "Purchases",
     "author": "Odoo Community Association (OCA)",
     "license": "AGPL-3",

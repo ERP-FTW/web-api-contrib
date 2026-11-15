@@ -47,6 +47,8 @@ class EndpointEndpoint(models.Model):
 class EndpointMixin(models.AbstractModel):
     _inherit = "endpoint.mixin"
 
+    _catalog_max_page_size = 2000
+
     def _selection_exec_mode(self):
         return super()._selection_exec_mode() + [
             ("customer_pricelist_export", "Customer Pricelist Export (Resolved)"),
@@ -88,8 +90,8 @@ class EndpointMixin(models.AbstractModel):
         except Exception:
             params = {}
 
-        limit = self._safe_int(params.get("limit"), default=0) or 2000
-        offset = self._safe_int(params.get("offset"), default=0)
+        limit = self._bounded_page_limit(params.get("limit"))
+        offset = max(0, self._safe_int(params.get("offset"), default=0))
         include_inactive = self._safe_bool(params.get("include_inactive"), default=False)
         only_purchasable = self._safe_bool(params.get("only_purchasable"), default=True)
 
@@ -125,6 +127,7 @@ class EndpointMixin(models.AbstractModel):
         if getattr(self, "lang_id", False):
             product_env = product_env.with_context(lang=self.lang_id.code)
 
+        total_count = product_env.search_count(domain)
         products = product_env.search(domain, offset=offset, limit=limit, order="id")
 
         currency = getattr(pricelist, "currency_id", False)
@@ -145,6 +148,11 @@ class EndpointMixin(models.AbstractModel):
                 "limit": limit,
                 "offset": offset,
                 "count": len(products),
+                "total_count": total_count,
+                "has_more": offset + len(products) < total_count,
+                "next_offset": offset + len(products)
+                if offset + len(products) < total_count
+                else False,
                 "include_inactive": include_inactive,
                 "only_purchasable": only_purchasable,
             },
@@ -174,6 +182,12 @@ class EndpointMixin(models.AbstractModel):
             return int(value)
         except Exception:
             return default
+
+    def _bounded_page_limit(self, value):
+        limit = self._safe_int(value, default=self._catalog_max_page_size)
+        if limit <= 0:
+            return self._catalog_max_page_size
+        return min(limit, self._catalog_max_page_size)
 
     @staticmethod
     def _safe_bool(value, default=False):
@@ -213,6 +227,17 @@ class EndpointMixin(models.AbstractModel):
 
         currency = getattr(pricelist, "currency_id", False)
 
+        uom_external_id = False
+        reference_external_id = False
+        if uom_po:
+            uom_external_id = uom_po.get_external_id().get(uom_po.id) or False
+            reference_uom = uom_po
+            while reference_uom.relative_uom_id:
+                reference_uom = reference_uom.relative_uom_id
+            reference_external_id = (
+                reference_uom.get_external_id().get(reference_uom.id) or False
+            )
+
         data = {
             "vendor_product_id": product.id,
             "default_code": getattr(product, "default_code", False),
@@ -220,12 +245,15 @@ class EndpointMixin(models.AbstractModel):
             "name": product.display_name,
             "purchase_uom": {
                 "id": uom_po.id if uom_po else False,
+                "external_id": uom_external_id,
                 "name": uom_po.name if uom_po else False,
+                "reference_external_id": reference_external_id,
             },
             "price": {
                 "value": price_val,
                 "currency": {
                     "id": currency.id if currency else False,
+                    "code": currency.name if currency else False,
                     "name": currency.name if currency else False,
                     "symbol": currency.symbol if currency else False,
                 },
@@ -248,39 +276,25 @@ class EndpointMixin(models.AbstractModel):
         return data
 
     def _compute_pricelist_price(self, pricelist, product, partner, qty=1.0, uom=None):
-        price = None
-        rule_id = False
+        # Odoo 19 makes currency/uom/date keyword-only. The selected
+        # pricelist already represents the customer contract, so a pricing
+        # API error must not be hidden by a list-price fallback.
+        try:
+            price, rule_id = pricelist._get_product_price_rule(
+                product,
+                qty,
+                currency=pricelist.currency_id,
+                uom=uom,
+            )
+        except Exception as exc:
+            raise UserError(
+                _("Could not compute the customer pricelist price for %s: %s")
+                % (product.display_name, exc)
+            ) from exc
+
         rule_min_qty = None
-
-        try:
-            if hasattr(pricelist, "_get_product_price"):
-                ctx = {"uom": uom.id} if uom else {}
-                price = pricelist.with_context(**ctx)._get_product_price(product, qty, partner)
-        except Exception as exc:
-            _logger.debug("Pricelist _get_product_price failed for product %s: %s", product.id, exc)
-
-        try:
-            if hasattr(pricelist, "_get_product_price_rule"):
-                ctx = {"uom": uom.id} if uom else {}
-                res = pricelist.with_context(**ctx)._get_product_price_rule(product, qty, partner)
-                if isinstance(res, (list, tuple)) and len(res) >= 2:
-                    if price is None:
-                        price = res[0]
-                    rule_id = res[1]
-                    if rule_id:
-                        rule = pricelist.env["product.pricelist.item"].browse(rule_id)
-                        if rule.exists() and hasattr(rule, "min_quantity"):
-                            rule_min_qty = rule.min_quantity
-        except Exception as exc:
-            _logger.debug("Pricelist _get_product_price_rule failed for product %s: %s", product.id, exc)
-
-        if price is None:
-            price = getattr(product, "list_price", 0.0)
-            _logger.debug("Pricelist price fallback for product %s: list_price=%s", product.id, price)
-
-        try:
-            price = float(price)
-        except Exception:
-            price = 0.0
-
-        return price, rule_id, rule_min_qty
+        if rule_id:
+            rule = pricelist.env["product.pricelist.item"].browse(rule_id).exists()
+            if rule:
+                rule_min_qty = rule.min_quantity
+        return float(price), rule_id, rule_min_qty
