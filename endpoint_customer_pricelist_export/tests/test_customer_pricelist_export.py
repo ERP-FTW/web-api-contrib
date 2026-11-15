@@ -132,3 +132,19 @@ class TestCustomerPricelistExport(TransactionCase):
         endpoint.catalog_partner_id = False
         with self.assertRaisesRegex(UserError, "Missing Catalog Customer"):
             endpoint._validate_exec__customer_pricelist_export()
+
+    def test_missing_explicit_and_customer_pricelist_fails_closed(self):
+        partner = self.env["res.partner"].create(
+            {"name": "Synthetic Customer Without Pricelist"}
+        )
+        partner.property_product_pricelist = False
+        self.assertFalse(partner.property_product_pricelist)
+        with self.assertRaisesRegex(UserError, "No pricelist found"):
+            self.endpoint.copy(
+                {
+                    "name": "Missing Pricelist",
+                    "route": "/synthetic/missing-pricelist",
+                    "catalog_partner_id": partner.id,
+                    "catalog_pricelist_id": False,
+                }
+            )
